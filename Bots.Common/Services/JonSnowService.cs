@@ -25,6 +25,10 @@
 
         private static readonly double logScoreFactor = 2;
 
+        private static readonly double scoreThreshold = 0.95;
+
+        private static readonly int kbResponseThreshold = 20;
+
         public JonSnowService(IConfiguration configuration, IHttpService httpService)
         {
             this.configuration = configuration;
@@ -35,12 +39,14 @@
         public async Task<string> GetResponse(string prompt)
         {
             string response;
+            var kbHitCount = 0;
 
             do
             {
-                response = await this.GetRawResponse(prompt);
+                response = await this.GetResponse(prompt, kbHitCount >= kbResponseThreshold);
+                kbHitCount++;
             }
-            while (this.GetResponseScore(response) > 0.67);
+            while (this.GetResponseScore(response) < scoreThreshold);
             
             if (responsesSaved == responsesQueueCapacity)
             {
@@ -66,55 +72,58 @@
             {
                 if (this.responses[i] == response)
                 {
-                    score += 1 / Math.Pow(logScoreFactor, i);
+                    score += 1 / Math.Pow(logScoreFactor, responsesSaved - i - 1);
                 }
             }
 
-            var maxPossibleScore = (Math.Pow(1 / logScoreFactor, responsesQueueCapacity) - 1) / ((1 / logScoreFactor) - 1);
-            return score / maxPossibleScore;
+            var maxPossibleScore = (Math.Pow(1 / logScoreFactor, responsesSaved) - 1) / ((1 / logScoreFactor) - 1);
+            return 1.0 - (score / maxPossibleScore);
         }
 
-        private async Task<string> GetRawResponse(string prompt)
+        private async Task<string> GetResponse(string prompt, bool forceRandom)
         {
-            var messageWithoutJonSnow = prompt.Replace("jon snow", string.Empty, StringComparison.InvariantCultureIgnoreCase).Replace("jon", string.Empty, StringComparison.InvariantCultureIgnoreCase);
-            var messageWithJonSnow = prompt;
-
-            var knowledgeBaseTask1 = this.httpService.Post(
-                new Uri(this.configuration["KnowledgeBaseEndpoint"]),
-                $"{{\"question\":\"{messageWithJonSnow}\",\"top\":5}}",
-                "application/json",
-                new Dictionary<string, string> { { "Authorization", $"EndpointKey {this.configuration["KnowledgeBaseEndpointKey"]}" } });
-
-            var knowledgeBaseTask2 = this.httpService.Post(
-                new Uri(this.configuration["KnowledgeBaseEndpoint"]),
-                $"{{\"question\":\"{messageWithoutJonSnow}\",\"top\":5}}",
-                "application/json",
-                new Dictionary<string, string> { { "Authorization", $"EndpointKey {this.configuration["KnowledgeBaseEndpointKey"]}" } });
-
-            var apiTasks = new List<Task>
+            if (!forceRandom)
             {
-                knowledgeBaseTask1,
-                knowledgeBaseTask2
-            };
+                var messageWithoutJonSnow = prompt.Replace("jon snow", string.Empty, StringComparison.InvariantCultureIgnoreCase).Replace("jon", string.Empty, StringComparison.InvariantCultureIgnoreCase);
+                var messageWithJonSnow = prompt;
 
-            await Task.WhenAll(apiTasks);
-            var knowledgeBaseResponse1 = knowledgeBaseTask1.Result;
-            var knowledgeBaseResponse2 = knowledgeBaseTask2.Result;
+                var knowledgeBaseTask1 = this.httpService.Post(
+                    new Uri(this.configuration["KnowledgeBaseEndpoint"]),
+                    $"{{\"question\":\"{messageWithJonSnow}\",\"top\":5}}",
+                    "application/json",
+                    new Dictionary<string, string> { { "Authorization", $"EndpointKey {this.configuration["KnowledgeBaseEndpointKey"]}" } });
 
-            if (knowledgeBaseResponse1.IsSuccessStatusCode && knowledgeBaseResponse2.IsSuccessStatusCode)
-            {
-                var responseContent1 = JsonConvert.DeserializeObject<KnowledgeBaseResponse>(knowledgeBaseResponse1.Content);
-                var responseContent2 = JsonConvert.DeserializeObject<KnowledgeBaseResponse>(knowledgeBaseResponse2.Content);
-                var allAnswers = new List<KnowledgeBaseAnswer>(responseContent1.Answers);
-                allAnswers.AddRange(responseContent2.Answers);
-                allAnswers.Sort(new KnowledgeBaseAnswerComparerByScore());
+                var knowledgeBaseTask2 = this.httpService.Post(
+                    new Uri(this.configuration["KnowledgeBaseEndpoint"]),
+                    $"{{\"question\":\"{messageWithoutJonSnow}\",\"top\":5}}",
+                    "application/json",
+                    new Dictionary<string, string> { { "Authorization", $"EndpointKey {this.configuration["KnowledgeBaseEndpointKey"]}" } });
 
-                if (allAnswers.Any())
+                var apiTasks = new List<Task>
                 {
-                    var highestScore = allAnswers.First().Score;
-                    if (random.NextDouble() * 100.0 <= highestScore)
+                    knowledgeBaseTask1,
+                    knowledgeBaseTask2
+                };
+
+                await Task.WhenAll(apiTasks);
+                var knowledgeBaseResponse1 = knowledgeBaseTask1.Result;
+                var knowledgeBaseResponse2 = knowledgeBaseTask2.Result;
+
+                if (knowledgeBaseResponse1.IsSuccessStatusCode && knowledgeBaseResponse2.IsSuccessStatusCode)
+                {
+                    var responseContent1 = JsonConvert.DeserializeObject<KnowledgeBaseResponse>(knowledgeBaseResponse1.Content);
+                    var responseContent2 = JsonConvert.DeserializeObject<KnowledgeBaseResponse>(knowledgeBaseResponse2.Content);
+                    var allAnswers = new List<KnowledgeBaseAnswer>(responseContent1.Answers);
+                    allAnswers.AddRange(responseContent2.Answers);
+                    allAnswers.Sort(new KnowledgeBaseAnswerComparerByScore());
+
+                    if (allAnswers.Any())
                     {
-                        return allAnswers.First().Answer;
+                        var highestScore = allAnswers.First().Score;
+                        if (random.NextDouble() * 100.0 <= highestScore)
+                        {
+                            return allAnswers.First().Answer;
+                        }
                     }
                 }
             }
